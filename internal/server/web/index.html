@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>VibeDE — read-only code intelligence</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div id="app">
+    <div class="boot">
+      <div class="boot-logo">VibeDE</div>
+      <div class="boot-note">Starting the read-only code intelligence server…</div>
+    </div>
+  </div>
+  <script src="/wasm_exec.js"></script>
+  <script>
+    (() => {
+      const boot = document.getElementById('app');
+      if (!window.Go) {
+        boot.innerHTML = '<div class="boot"><div class="boot-logo">VibeDE</div><div class="boot-error">Go WebAssembly runtime failed to load (wasm_exec.js). Run the Makefile build.</div></div>';
+        return;
+      }
+      const go = new Go();
+      WebAssembly.instantiateStreaming(fetch('/app.wasm'), go.importObject)
+        .then((result) => { go.run(result.instance); })
+        .catch((err) => {
+          boot.innerHTML = '<div class="boot"><div class="boot-logo">VibeDE</div><div class="boot-error">Could not start the Go WebAssembly client: ' +
+            String(err).replace(/[<>&]/g, '') + '. Build it with <code>make web</code>.</div></div>';
+        });
+    })();
+  </script>
+</body>
+</html>
