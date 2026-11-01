@@ -338,6 +338,30 @@ func libraryCallCost(fam genFamily, name, recv string) (Complexity, string) {
 
 // ---------------- Python ----------------
 
+// treeChildProps names node properties whose traversal visits each node once.
+// Iterating one of them inside a recursive function is a tree/graph descent,
+// not a linear rescan on top of the recursion.
+var treeChildProps = map[string]bool{
+	"children":   true,
+	"childnodes": true,
+	"next":       true,
+	"left":       true,
+	"right":      true,
+}
+
+func isTreeChildProp(name string) bool { return treeChildProps[strings.ToLower(name)] }
+
+// treeIterableTokens reports whether a loop header iterates a node's children,
+// e.g. `for (child of node.children)`, `for c in node.left:`, or `while n.next`.
+func treeIterableTokens(ts []genToken) bool {
+	for i := 0; i+1 < len(ts); i++ {
+		if ts[i].text == "." && isTreeChildProp(ts[i+1].text) {
+			return true
+		}
+	}
+	return false
+}
+
 type pyLoop struct {
 	line    int
 	indent  int
@@ -345,6 +369,10 @@ type pyLoop struct {
 	factor  Complexity
 	cum     Complexity
 	depth   int
+	// tree marks loops iterating a node's children (`for c in node.children`).
+	// A recursive call inside such a loop descends a tree once per node, so
+	// the loop is not an extra O(n) factor on top of the recursion.
+	tree bool
 }
 
 func (e *genericBigO) pythonBase(f *genericFunc) BigOResult {
@@ -429,6 +457,10 @@ func (e *genericBigO) pyLoops(f *genericFunc) []pyLoop {
 		if !isLoop {
 			continue
 		}
+		tree := false
+		if lo, hi := e.lineTokenRange(ln); lo >= 0 && hi >= lo && hi < len(e.s.toks) {
+			tree = treeIterableTokens(e.s.toks[lo : hi+1])
+		}
 		indent := lineIndent(ln)
 		end := ln
 		for next := ln + 1; next <= f.lineHi; next++ {
@@ -440,7 +472,7 @@ func (e *genericBigO) pyLoops(f *genericFunc) []pyLoop {
 			}
 			end = next
 		}
-		lp := pyLoop{line: ln, indent: indent, endLine: end, factor: factor}
+		lp := pyLoop{line: ln, indent: indent, endLine: end, factor: factor, tree: tree}
 		if strings.HasPrefix(mt, "while ") {
 			condLo, condHi := e.lineTokenRange(ln)
 			condStart := -1
@@ -538,6 +570,25 @@ func pyLineProduct(loops []pyLoop, line int) Complexity {
 	return c
 }
 
+// pyLineProductNoTree is pyLineProduct for recursive calls: loops that walk a
+// tree's children are skipped because the recursion itself accounts for them.
+// It also reports whether the line sits inside such a tree loop.
+func pyLineProductNoTree(loops []pyLoop, line int) (Complexity, bool) {
+	c := O1()
+	tree := false
+	for _, lp := range loops {
+		if line <= lp.line || line > lp.endLine {
+			continue
+		}
+		if lp.tree {
+			tree = true
+			continue
+		}
+		c = c.Mul(lp.factor)
+	}
+	return c, tree
+}
+
 func (e *genericBigO) pyComprehensions(f *genericFunc, loops []pyLoop, nested func(int) bool) (map[int]Complexity, []string) {
 	out := make(map[int]Complexity)
 	var evidence []string
@@ -605,6 +656,10 @@ type braceLoop struct {
 	bodyLo int
 	bodyHi int
 	kind   string
+	// tree marks loops iterating a node's children (`for (c of node.children)`,
+	// `node.children.forEach(...)`). A recursive call inside such a loop is a
+	// tree traversal, not an O(n) rescan per recursive frame.
+	tree bool
 }
 
 func (e *genericBigO) braceBase(f *genericFunc) BigOResult {
@@ -696,6 +751,10 @@ func (e *genericBigO) braceLoops(f *genericFunc) []braceLoop {
 					loopHasLog(e.s, bodyLo, bodyHi, cLo, cHi) {
 					lp.factor = OLogN()
 				}
+				if hdrLo, hdrHi, _, ok := e.loopParts(whileIdx, f.bodyHi); ok &&
+					hdrLo >= 0 && hdrHi >= hdrLo && hdrHi < len(e.s.toks) {
+					lp.tree = treeIterableTokens(e.s.toks[hdrLo : hdrHi+1])
+				}
 				skipWhile[whileIdx] = true
 			}
 			loops = append(loops, lp)
@@ -718,6 +777,9 @@ func (e *genericBigO) braceLoops(f *genericFunc) []braceLoop {
 			}
 			bodyLo, bodyHi := e.s.blockBody(bodyStart, f.bodyHi)
 			lp := braceLoop{line: e.s.toks[i].line, bodyLo: bodyLo, bodyHi: bodyHi}
+			if hdrLo >= 0 && hdrHi >= hdrLo && hdrHi < len(e.s.toks) {
+				lp.tree = treeIterableTokens(e.s.toks[hdrLo : hdrHi+1])
+			}
 			if t == "for" {
 				if forConstantBound(e.s.toks[hdrLo : hdrHi+1]) {
 					lp.factor = O1()
@@ -748,6 +810,9 @@ func (e *genericBigO) braceLoops(f *genericFunc) []braceLoop {
 				loops = append(loops, braceLoop{
 					line: e.s.toks[i].line, factor: ON(), kind: "callback",
 					bodyLo: i + 2, bodyHi: close - 1,
+					// `node.children.forEach(...)`: the iterated collection is
+					// the member immediately before the callback method.
+					tree: i >= 3 && e.s.toks[i-3].text == "." && isTreeChildProp(e.s.toks[i-2].text),
 				})
 			}
 		}
@@ -837,6 +902,25 @@ func braceContainerProduct(loops []braceLoop, tok int) Complexity {
 		}
 	}
 	return c
+}
+
+// braceContainerProductNoTree is braceContainerProduct for recursive calls:
+// loops over a tree's children are skipped and reported so the recursion is
+// not charged an extra O(n) per frame.
+func braceContainerProductNoTree(loops []braceLoop, tok int) (Complexity, bool) {
+	c := O1()
+	tree := false
+	for _, lp := range loops {
+		if tok < lp.bodyLo || tok > lp.bodyHi {
+			continue
+		}
+		if lp.tree {
+			tree = true
+			continue
+		}
+		c = c.Mul(lp.factor)
+	}
+	return c, tree
 }
 
 func (e *genericBigO) insideNestedBrace(f *genericFunc, tok int) bool {
@@ -1084,15 +1168,16 @@ func (e *genericBigO) recursion(f *genericFunc) BigOResult {
 	}
 	vars := assignedHalvingVars(e.s.toks[f.bodyLo : f.bodyHi+1])
 	halving, decrement, linear := false, false, false
-	var loopProduct func(tok, line int) Complexity
+	var loopProduct func(tok, line int) (Complexity, bool)
 	if f.python {
 		loops := e.pyLoops(f)
-		loopProduct = func(_ int, line int) Complexity { return pyLineProduct(loops, line) }
+		loopProduct = func(_ int, line int) (Complexity, bool) { return pyLineProductNoTree(loops, line) }
 	} else {
 		loops := e.braceLoops(f)
-		loopProduct = func(tok int, _ int) Complexity { return braceContainerProduct(loops, tok) }
+		loopProduct = func(tok int, _ int) (Complexity, bool) { return braceContainerProductNoTree(loops, tok) }
 	}
 	maxProduct := O1()
+	treeTraversal := false
 	for _, cs := range rec {
 		args := callArgs(e.s, cs.tok)
 		for _, arg := range args {
@@ -1101,7 +1186,9 @@ func (e *genericBigO) recursion(f *genericFunc) BigOResult {
 			decrement = decrement || d
 			linear = linear || l
 		}
-		maxProduct = maxProduct.Max(loopProduct(cs.tok, cs.line))
+		prod, inTree := loopProduct(cs.tok, cs.line)
+		treeTraversal = treeTraversal || inTree
+		maxProduct = maxProduct.Max(prod)
 	}
 	var c Complexity
 	var shape string
@@ -1112,6 +1199,8 @@ func (e *genericBigO) recursion(f *genericFunc) BigOResult {
 		c, shape = ONLogN(), "two divide-and-conquer recursive calls → O(n log n)"
 	case len(rec) >= 2 && decrement:
 		c, shape = OExp(), "overlapping recursive calls with decremented input → O(2^n)"
+	case treeTraversal && !halving && !decrement && maxProduct.IsConstant():
+		c, shape = ON(), "recursive call over tree children → O(n) (each node visited once)"
 	case len(rec) == 1:
 		c, shape = ON(), "single recursive call → O(n)"
 	case !halving && !decrement && linear:

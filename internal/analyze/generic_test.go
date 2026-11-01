@@ -128,6 +128,103 @@ func TestGenericPythonBigO(t *testing.T) {
 	}
 }
 
+func TestGenericTreeTraversalBigO(t *testing.T) {
+	cases := []struct {
+		name     string
+		file     string
+		lang     string
+		src      string
+		want     string
+		evidence string
+	}{
+		{
+			name: "python children loop",
+			file: "walk.py", lang: "python",
+			src: `def walk(node):
+    total = 0
+    for child in node.children:
+        total += walk(child)
+    return total
+`,
+			want: "O(n)", evidence: "tree children",
+		},
+		{
+			name: "python binary children tuple",
+			file: "walk.py", lang: "python",
+			src: `def walk(node):
+    total = 0
+    for child in (node.left, node.right):
+        total += walk(child)
+    return total
+`,
+			want: "O(n)", evidence: "tree children",
+		},
+		{
+			name: "python linked list next",
+			file: "list.py", lang: "python",
+			src: `def walk(node):
+    total = 0
+    while node.next:
+        total += walk(node.next)
+        node = node.next
+    return total
+`,
+			want: "O(n)", evidence: "tree children",
+		},
+		{
+			name: "js children for-of",
+			file: "walk.js", lang: "javascript",
+			src: `function walk(node) {
+  let total = 0;
+  for (const child of node.children) {
+    total += walk(child);
+  }
+  return total;
+}
+`,
+			want: "O(n)", evidence: "tree children",
+		},
+		{
+			name: "js children forEach",
+			file: "walk.js", lang: "javascript",
+			src: `function walk(node) {
+  let total = 0;
+  node.children.forEach(child => { total += walk(child); });
+  return total;
+}
+`,
+			want: "O(n)", evidence: "tree children",
+		},
+		{
+			name: "real nested loop still multiplies",
+			file: "walk.py", lang: "python",
+			src: `def walk(node, xs):
+    total = 0
+    for child in node.children:
+        for x in xs:
+            total += walk(child) + x
+    return total
+`,
+			want: "O(n²)",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := mustAnalyze(t, tc.file, tc.lang, tc.src)
+			if len(a.Functions) == 0 {
+				t.Fatal("no functions analyzed")
+			}
+			fn := &a.Functions[0]
+			if fn.BigO != tc.want {
+				t.Fatalf("%s BigO = %s, want %s (evidence %v)", fn.Name, fn.BigO, tc.want, fn.Evidence)
+			}
+			if tc.evidence != "" && !hasEvidence(fn, tc.evidence) {
+				t.Fatalf("%s evidence = %v, want substring %q", fn.Name, fn.Evidence, tc.evidence)
+			}
+		})
+	}
+}
+
 func TestGenericPythonStructure(t *testing.T) {
 	src := `import os
 import sys as system
