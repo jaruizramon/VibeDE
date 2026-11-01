@@ -1,7 +1,9 @@
 // Package server exposes VibeDE's read-only HTTP API and embedded UI.
 //
 // There is deliberately no write endpoint. The only POST routes are queries
-// (open document, navigate, hover, restart server) plus a diagnostic rescan.
+// (open document, navigate, hover, selection explanation) plus server
+// restart/rescan. Explanations are forwarded to the configured model endpoint;
+// nothing in the workspace is modified.
 package server
 
 import (
@@ -15,6 +17,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,10 +27,14 @@ import (
 	"vibede/internal/analyze"
 	"vibede/internal/config"
 	"vibede/internal/lsp"
+	"vibede/internal/rab"
 	"vibede/internal/version"
 	"vibede/internal/watch"
 	"vibede/internal/workspace"
 )
+
+// maxArchiveEntries bounds each history list in the .rab archive.
+const maxArchiveEntries = 200
 
 //go:embed web/*
 var webFS embed.FS
@@ -41,12 +48,16 @@ type Server struct {
 	lsp     *lsp.Manager
 	engine  *analyze.Engine
 	broker  *broker
+	archive *rab.Archive
 	static  map[string][]byte
 
 	start   time.Time
 	ctx     context.Context
 	cancel  context.CancelFunc
 	closeMu sync.Once
+
+	aiMu    sync.Mutex
+	aiModel string
 
 	windowMu     sync.Mutex
 	windowOpener func(url, title string) error
@@ -75,6 +86,7 @@ func New(cfg config.Config) (*Server, error) {
 		tracker: tracker,
 		engine:  analyze.NewEngine(ws, cfg),
 		broker:  b,
+		archive: rab.Open(filepath.Join(cfg.Root, rab.FileName), maxArchiveEntries, maxArchiveEntries),
 		static:  assets,
 		start:   time.Now().UTC(),
 		ctx:     ctx,
@@ -94,6 +106,7 @@ func New(cfg config.Config) (*Server, error) {
 	})
 	watcher, err := watch.New(ws, tracker, cfg.Debounce(), func(ch watch.Change) {
 		s.engine.Invalidate(ch.Path)
+		s.archive.AddChange(ch)
 		if !ch.IsDir {
 			go s.lsp.Change(ch.Path)
 		}
@@ -107,6 +120,7 @@ func New(cfg config.Config) (*Server, error) {
 	s.watcher = watcher
 	go watcher.Run(ctx)
 	go tracker.Seed(ctx)
+	go s.archive.Run(ctx)
 	return s, nil
 }
 
@@ -117,6 +131,7 @@ func (s *Server) Close() {
 		if s.watcher != nil {
 			_ = s.watcher.Close()
 		}
+		_ = s.archive.Close()
 		s.lsp.Close()
 		s.broker.Close()
 	})
@@ -137,10 +152,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/search", s.handleSearch)
 	mux.HandleFunc("GET /api/search/code", s.handleCodeSearch)
 	mux.HandleFunc("GET /api/events", s.handleEvents)
+	mux.HandleFunc("GET /api/archive", s.handleArchive)
 	mux.HandleFunc("POST /api/lsp/open", s.handleLSPOpen)
 	mux.HandleFunc("POST /api/lsp/close", s.handleLSPClose)
 	mux.HandleFunc("POST /api/navigate", s.handleNavigate)
 	mux.HandleFunc("POST /api/hover", s.handleHover)
+	mux.HandleFunc("POST /api/explain", s.handleExplain)
 	mux.HandleFunc("POST /api/servers/restart", s.handleServerRestart)
 	mux.HandleFunc("POST /api/servers/rescan", s.handleServerRescan)
 	mux.HandleFunc("POST /api/detach", s.handleDetach)
@@ -306,6 +323,24 @@ type Info struct {
 	Watcher    WatcherInfo      `json:"watcher"`
 	Features   []string         `json:"features"`
 	History    int              `json:"history"`
+	AI         AIInfo           `json:"ai"`
+	Archive    ArchiveInfo      `json:"archive"`
+}
+
+// ArchiveInfo describes the persisted .rab history.
+type ArchiveInfo struct {
+	Path         string `json:"path"`
+	Bytes        int64  `json:"bytes"`
+	Changes      int    `json:"changes"`
+	Explanations int    `json:"explanations"`
+}
+
+// AIInfo describes the explanation endpoint without exposing its API key.
+type AIInfo struct {
+	Enabled  bool   `json:"enabled"`
+	Endpoint string `json:"endpoint,omitempty"`
+	Model    string `json:"model,omitempty"`
+	Thinking bool   `json:"thinking"`
 }
 
 type WatcherInfo struct {
@@ -332,8 +367,27 @@ func (s *Server) info() Info {
 			"Language-server diagnostics and navigation",
 			"Structure, cyclomatic complexity and Big-O per function",
 			"Deterministic flowcharts, UML, use-case, sequence and import diagrams",
+			"Ask an SLM about a selection, with the file and its imports as context",
+			"Edits and explanations persisted gzip-compressed in .vibede.rab",
 		},
 		History: len(s.changesHistory()),
+		AI: AIInfo{
+			Enabled:  s.cfg.AI.Enabled && strings.TrimSpace(s.cfg.AI.Endpoint) != "",
+			Endpoint: s.cfg.AI.Endpoint,
+			Model:    s.cfg.AI.Model,
+			Thinking: s.cfg.AI.Thinking,
+		},
+		Archive: s.archiveInfo(),
+	}
+}
+
+func (s *Server) archiveInfo() ArchiveInfo {
+	changes, explanations, bytes := s.archive.Stats()
+	return ArchiveInfo{
+		Path:         rab.FileName,
+		Bytes:        bytes,
+		Changes:      changes,
+		Explanations: explanations,
 	}
 }
 
@@ -343,6 +397,32 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) handleInfo(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, s.info())
+}
+
+type archiveResponse struct {
+	Path         string            `json:"path"`
+	Bytes        int64             `json:"bytes"`
+	Changes      []watch.Change    `json:"changes"`
+	Explanations []rab.Explanation `json:"explanations"`
+}
+
+// handleArchive returns the persisted .rab history. The archive itself is a
+// gzip stream; this endpoint exposes the decoded entries to the UI.
+func (s *Server) handleArchive(w http.ResponseWriter, _ *http.Request) {
+	doc := s.archive.Snapshot()
+	_, _, bytes := s.archive.Stats()
+	if doc.Changes == nil {
+		doc.Changes = []watch.Change{}
+	}
+	if doc.Explanations == nil {
+		doc.Explanations = []rab.Explanation{}
+	}
+	writeJSON(w, http.StatusOK, archiveResponse{
+		Path:         rab.FileName,
+		Bytes:        bytes,
+		Changes:      doc.Changes,
+		Explanations: doc.Explanations,
+	})
 }
 
 type treeResponse struct {

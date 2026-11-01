@@ -5,18 +5,83 @@ package main
 import "time"
 
 type Info struct {
-	Name       string    `json:"name"`
-	Version    string    `json:"version"`
-	Root       string    `json:"root"`
-	ReadOnly   bool      `json:"readOnly"`
-	Detachable bool      `json:"detachable"`
-	StartedAt  time.Time `json:"startedAt"`
-	Languages  []string  `json:"languages"`
-	Limits     Limits    `json:"limits"`
-	Servers    []Server  `json:"servers"`
-	Watcher    Watcher   `json:"watcher"`
-	Features   []string  `json:"features"`
-	History    int       `json:"history"`
+	Name       string      `json:"name"`
+	Version    string      `json:"version"`
+	Root       string      `json:"root"`
+	ReadOnly   bool        `json:"readOnly"`
+	Detachable bool        `json:"detachable"`
+	StartedAt  time.Time   `json:"startedAt"`
+	Languages  []string    `json:"languages"`
+	Limits     Limits      `json:"limits"`
+	Servers    []Server    `json:"servers"`
+	Watcher    Watcher     `json:"watcher"`
+	Features   []string    `json:"features"`
+	History    int         `json:"history"`
+	AI         AISettings  `json:"ai"`
+	Archive    ArchiveInfo `json:"archive"`
+}
+
+// ArchiveInfo describes the persisted .rab history.
+type ArchiveInfo struct {
+	Path         string `json:"path"`
+	Bytes        int64  `json:"bytes"`
+	Changes      int    `json:"changes"`
+	Explanations int    `json:"explanations"`
+}
+
+// ExplainRecord is one archived AI answer.
+type ExplainRecord struct {
+	At          time.Time    `json:"at"`
+	Path        string       `json:"path,omitempty"`
+	Language    string       `json:"language,omitempty"`
+	Function    string       `json:"function,omitempty"`
+	StartLine   int          `json:"startLine,omitempty"`
+	EndLine     int          `json:"endLine,omitempty"`
+	Question    string       `json:"question"`
+	Answer      string       `json:"answer"`
+	Model       string       `json:"model,omitempty"`
+	Context     []string     `json:"context,omitempty"`
+	Annotations []Annotation `json:"annotations,omitempty"`
+}
+
+// Annotation is one line-anchored note rendered above a code line.
+type Annotation struct {
+	StartLine int    `json:"startLine"`
+	EndLine   int    `json:"endLine,omitempty"`
+	Text      string `json:"text"`
+}
+
+type ArchiveResponse struct {
+	Path         string          `json:"path"`
+	Bytes        int64           `json:"bytes"`
+	Changes      []Change        `json:"changes"`
+	Explanations []ExplainRecord `json:"explanations"`
+}
+
+// AISettings mirrors the server's explanation endpoint description.
+type AISettings struct {
+	Enabled  bool   `json:"enabled"`
+	Endpoint string `json:"endpoint,omitempty"`
+	Model    string `json:"model,omitempty"`
+	Thinking bool   `json:"thinking"`
+}
+
+type ExplainRequest struct {
+	Path      string `json:"path"`
+	Language  string `json:"language,omitempty"`
+	Function  string `json:"function,omitempty"`
+	StartLine int    `json:"startLine"`
+	EndLine   int    `json:"endLine"`
+	Code      string `json:"code"`
+	Question  string `json:"question"`
+}
+
+type ExplainResponse struct {
+	Explanation string       `json:"explanation"`
+	Model       string       `json:"model"`
+	Question    string       `json:"question"`
+	Context     []string     `json:"context"`
+	Annotations []Annotation `json:"annotations,omitempty"`
 }
 
 type Limits struct {

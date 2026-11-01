@@ -15,6 +15,7 @@ import (
 	"syscall"
 
 	"vibede/internal/apphost"
+	"vibede/internal/config"
 	"vibede/internal/desktop"
 	"vibede/internal/version"
 )
@@ -26,6 +27,10 @@ func main() {
 	ui := flag.String("ui", "native", "native (GTK/WebKit window), browser, or headless")
 	openBrowserFlag := flag.Bool("open", false, "open in the external browser (same as --ui browser)")
 	noServers := flag.Bool("no-servers", false, "disable all language servers")
+	aiURL := flag.String("ai-url", "", "OpenAI-compatible base URL for selection explanations (default http://127.0.0.1:8080/v1)")
+	aiModel := flag.String("ai-model", "", "model id for explanations; empty uses the first model the endpoint serves")
+	aiKey := flag.String("ai-key", "", "API key for the explanation endpoint (also VIBEDE_AI_KEY)")
+	noAI := flag.Bool("no-ai", false, "disable AI selection explanations")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
 
@@ -44,14 +49,23 @@ func main() {
 		log.Fatalf("vibede: --ui must be native, browser or headless (got %q)", mode)
 	}
 
+	ai := aiOverride(*aiURL, *aiModel, *aiKey, *noAI)
 	if mode == "native" {
-		runNative(*root, *host, *port, *noServers)
+		runNative(*root, *host, *port, *noServers, ai)
 		return
 	}
-	runHeadless(*root, *host, *port, *noServers, mode == "browser")
+	runHeadless(*root, *host, *port, *noServers, ai, mode == "browser")
 }
 
-func runNative(root, host string, port int, noServers bool) {
+// aiOverride builds the flag override, or nil when no AI flag was set.
+func aiOverride(url, model, key string, off bool) *config.AIConfig {
+	if !off && url == "" && model == "" && key == "" {
+		return nil
+	}
+	return &config.AIConfig{Endpoint: url, Model: model, APIKey: key, Disabled: off}
+}
+
+func runNative(root, host string, port int, noServers bool, ai *config.AIConfig) {
 	if !desktop.Available() {
 		log.Fatalf("vibede: native UI unavailable: need Linux with GTK3 + WebKitGTK 4.1 and a display\n" +
 			"        use --ui browser (external browser) or --ui headless (only print the URL)")
@@ -67,6 +81,7 @@ func runNative(root, host string, port int, noServers bool) {
 		URLHost:      "127.0.0.1",
 		Port:         0,
 		NoServers:    noServers,
+		AI:           ai,
 		WindowOpener: desktop.OpenWindow,
 	})
 	start := func(nextRoot string) (string, error) {
@@ -102,7 +117,7 @@ func runNative(root, host string, port int, noServers bool) {
 	}
 }
 
-func runHeadless(root, host string, port int, noServers, openBrowser bool) {
+func runHeadless(root, host string, port int, noServers bool, ai *config.AIConfig, openBrowser bool) {
 	if root == "" {
 		root = "."
 	}
@@ -114,6 +129,7 @@ func runHeadless(root, host string, port int, noServers, openBrowser bool) {
 		URLHost:    host,
 		Port:       port,
 		NoServers:  noServers,
+		AI:         ai,
 	})
 	url, err := manager.Start(root)
 	if err != nil {

@@ -26,7 +26,38 @@ type fileConfig struct {
 	Servers   map[string]ServerOverride `json:"servers,omitempty"`
 	Limits    Limits                    `json:"limits,omitempty"`
 	Watch     WatchConfig               `json:"watch,omitempty"`
+	AI        AIConfig                  `json:"ai,omitempty"`
 	NoServers bool                      `json:"noServers,omitempty"`
+}
+
+// AIConfig points at an OpenAI-compatible chat endpoint used to explain a
+// selected code range. Something small and local is the intended target:
+// llama.cpp, vLLM and friends all serve /v1/chat/completions.
+type AIConfig struct {
+	// Enabled is resolved (file/env/flags) and false when Disabled is set.
+	Enabled   bool   `json:"enabled,omitempty"`
+	Disabled  bool   `json:"disabled,omitempty"`
+	Endpoint  string `json:"endpoint,omitempty"` // base URL ending in /v1
+	Model     string `json:"model,omitempty"`    // empty = first model the endpoint serves
+	APIKey    string `json:"apiKey,omitempty"`
+	MaxTokens int    `json:"maxTokens,omitempty"`
+	TimeoutMS int    `json:"timeoutMs,omitempty"`
+	Thinking  bool   `json:"thinking,omitempty"` // let reasoning models think before answering
+}
+
+// defaultAIEndpoint is llama.cpp's conventional OpenAI-compatible address.
+// VibeDE is only a client here; it never binds this port.
+const defaultAIEndpoint = "http://127.0.0.1:8080/v1"
+
+// DefaultAI is the local-first explanation endpoint. Point Endpoint elsewhere
+// (or set ai.disabled) to opt out.
+func DefaultAI() AIConfig {
+	return AIConfig{
+		Enabled:   true,
+		Endpoint:  defaultAIEndpoint,
+		MaxTokens: 1200,
+		TimeoutMS: 120000,
+	}
 }
 
 // Limits bounds how much file data VibeDE keeps in memory.
@@ -52,6 +83,7 @@ type Config struct {
 	Servers   map[string]ServerOverride
 	Limits    Limits
 	Watch     WatchConfig
+	AI        AIConfig
 	NoServers bool
 	Port      int
 	Open      bool
@@ -65,6 +97,9 @@ var DefaultIgnore = []string{
 	"node_modules", "__pycache__", ".venv", "venv", ".mypy_cache",
 	".pytest_cache", ".ruff_cache", ".tox", ".cache", ".next", ".nuxt",
 	".svelte-kit", "dist", "build", "target", ".idea", ".vscode",
+	// VibeDE's own history archive: written by the server, never part of the
+	// workspace view or the change feed.
+	".vibede.rab", ".vibede.rab.tmp",
 }
 
 // DefaultLimits are chosen so a normal repository is fully tracked without
@@ -103,6 +138,7 @@ func Load(root string) (Config, error) {
 		Ignore:  append([]string(nil), DefaultIgnore...),
 		Servers: map[string]ServerOverride{},
 		Limits:  DefaultLimits(),
+		AI:      DefaultAI(),
 		Watch: WatchConfig{
 			DebounceMS: 120,
 			MaxEvents:  500,
@@ -123,6 +159,7 @@ func Load(root string) (Config, error) {
 			cfg.Servers[k] = v
 		}
 		mergeLimits(&cfg.Limits, fc.Limits)
+		mergeAI(&cfg.AI, &fc.AI)
 		if fc.Watch.DebounceMS > 0 {
 			cfg.Watch.DebounceMS = fc.Watch.DebounceMS
 		}
@@ -130,7 +167,50 @@ func Load(root string) (Config, error) {
 			cfg.Watch.MaxEvents = fc.Watch.MaxEvents
 		}
 	}
+	// Environment overrides the file, flags override both.
+	mergeAI(&cfg.AI, &AIConfig{
+		Endpoint: os.Getenv("VIBEDE_AI_ENDPOINT"),
+		Model:    os.Getenv("VIBEDE_AI_MODEL"),
+		APIKey:   os.Getenv("VIBEDE_AI_KEY"),
+	})
 	return cfg, nil
+}
+
+// mergeAI applies non-zero fields of src to dst. Disabled wins.
+func mergeAI(dst *AIConfig, src *AIConfig) {
+	if src.Enabled {
+		dst.Enabled = true
+	}
+	if src.Disabled {
+		dst.Enabled = false
+	}
+	if src.Endpoint != "" {
+		dst.Endpoint = src.Endpoint
+	}
+	if src.Model != "" {
+		dst.Model = src.Model
+	}
+	if src.APIKey != "" {
+		dst.APIKey = src.APIKey
+	}
+	if src.MaxTokens > 0 {
+		dst.MaxTokens = src.MaxTokens
+	}
+	if src.TimeoutMS > 0 {
+		dst.TimeoutMS = src.TimeoutMS
+	}
+	if src.Thinking {
+		dst.Thinking = true
+	}
+}
+
+// ApplyAIOverrides merges command-line flag values into cfg. A nil src means
+// no flag changed anything.
+func ApplyAIOverrides(cfg *Config, src *AIConfig) {
+	if src == nil {
+		return
+	}
+	mergeAI(&cfg.AI, src)
 }
 
 func mergeLimits(dst *Limits, src Limits) {

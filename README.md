@@ -14,9 +14,21 @@ to audit, trace and understand what an agent is changing while it changes it:
   exports).
 - **Errors and warnings** — gopls, Pyright, TypeScript, HTML/CSS/JSON, clangd
   and rust-analyzer publish diagnostics over LSP.
+- **Selection explainer** — select code, ask a question in the popover, and a
+  local small model answers using the file and the files it imports. `Ctrl/⌘ + E`
+  opens it from the keyboard; `Enter` with an empty field means “explain this”.
+- **History in the Activity feed** — the same feed that shows recent edits also
+  shows each answer, and both are persisted across restarts in one
+  gzip-compressed `.vibede.rab` file.
+- **Inline line notes** — answers are requested as line-anchored notes
+  (`- **Line 125**: …`). Click an explanation in Activity (or “Show N line
+  notes” in the popover) and the notes render above the lines they describe,
+  without changing the file's line numbering; each note can be dismissed.
 
-VibeDE cannot edit the workspace. There is no write endpoint, and language
-servers' `workspace/applyEdit` requests are explicitly refused.
+VibeDE cannot edit your source files. There is no general write endpoint, and
+language servers' `workspace/applyEdit` requests are explicitly refused. The
+only file VibeDE writes is its own `.vibede.rab` history archive in the
+workspace root (see below); it is ignored by the watcher and explorer.
 
 ## Quick start
 
@@ -64,10 +76,12 @@ no Node build step).
 The window has a small native GTK bar with **Open Folder…** and the current
 workspace path, followed by the embedded VibeDE interface.
 
-- **Explorer** with directory expansion and filename filtering (`Ctrl/⌘ + K`).
-- **Code search** (`Ctrl/⌘ + Shift + F`): searches every text file in the
-  workspace, with an **Aa** case-sensitive toggle, line previews and match
-  counts. Clicking a result opens the file at that line and highlights it.
+- **Explorer** with directory expansion and filename filtering (`Ctrl/⌘ + K`
+  or `Ctrl/⌘ + P`).
+- **Code search** (`Ctrl/⌘ + F`; alias `Ctrl/⌘ + Shift + F`): searches every
+  text file in the workspace, with an **Aa** case-sensitive toggle, line
+  previews and match counts. Clicking a result opens the file at that line and
+  highlights it.
 - **Workspace chooser** on launch (when `--root` is omitted) and from the
   native **Open Folder…** button; switching roots reloads the interface.
 - **Empty workspace** shows the selected root and points to **Open Folder…**.
@@ -100,8 +114,14 @@ Keyboard/mouse:
 |---|---|
 | `Ctrl/⌘ + click` | Go to definition |
 | `Alt + click` | Find references |
-| `Ctrl/⌘ + K` | Focus file filter |
-| `Ctrl/⌘ + Shift + F` | Focus workspace code search |
+| `Ctrl/⌘ + F` | Focus workspace code search (alias `Ctrl/⌘ + Shift + F`) |
+| `Ctrl/⌘ + E` | Ask the small model about the selected code |
+| `Ctrl/⌘ + K` or `Ctrl/⌘ + P` | Focus file filter |
+| `Ctrl/⌘ + W` | Close the active tab |
+| `Ctrl/⌘ + \` | Toggle split editor |
+| `Ctrl/⌘ + PageDown` / `PageUp` | Next / previous tab |
+| `Alt + 1` … `Alt + 5` | Activity, Problems, Search, Diagrams, Inspector |
+| `F1` | Open help |
 | `Esc` | Close help |
 | **⌕ ◇ ! ◫ ⧉** | Inspector, diagrams, problems, split toggle, detach (icons appear in split mode; hover for labels) |
 | Toolbar **⌕ ◇ ! ◫ ⧉** | Inspector, diagrams, problems, split toggle, detach (icons appear in split mode; hover for labels) |
@@ -155,7 +175,10 @@ Each named function/method gets:
   - same-file helper composition (a helper called inside a loop multiplies);
   - recursion shapes: single halving → `O(log n)`, two halving calls →
     `O(n log n)`, overlapping decrementing calls → `O(2^n)`, linear recursion →
-    `O(n)`.
+    `O(n)`;
+  - tree traversal: recursion inside a loop over `.children`, `.childNodes`,
+    `.next`, `.left` or `.right` visits each node once → `O(n)`, instead of
+    multiplying the recursion by the loop.
 - **Evidence**: deterministic strings such as
   `nested loop at line 24 → O(n)` or
   `sort call at line 48 → O(n log n)`.
@@ -188,7 +211,9 @@ give you DOT and Mermaid source; SVG is rendered by VibeDE's own Go renderer.
 ## HTTP API
 
 All content endpoints are read-only. POST endpoints are queries or server
-lifecycle actions; none write workspace files.
+lifecycle actions; none write workspace files. `/api/explain` is the only route
+that sends workspace content off-process — to the endpoint configured in
+`ai.endpoint`, which defaults to loopback.
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -203,10 +228,12 @@ lifecycle actions; none write workspace files.
 | GET | `/api/search?q=` | Filename/path search |
 | GET | `/api/search/code?q=&case=1` | Case-sensitive/insensitive text search with file/line matches |
 | GET | `/api/events` | SSE: `ready`, `change`, `diagnostics`, `server` |
+| GET | `/api/archive` | Decoded `.vibede.rab` history: deltas and explanations |
 | POST | `/api/lsp/open` | Start a server and sync a document |
 | POST | `/api/lsp/close` | Stop syncing a document |
 | POST | `/api/navigate` | Definition/references/implementation/type definition |
 | POST | `/api/hover` | LSP hover |
+| POST | `/api/explain` | Ask the configured SLM about a selection; sends the selection, its file and linked imports |
 | POST | `/api/servers/restart` | Restart one server and reopen documents |
 | POST | `/api/servers/rescan` | Re-detect binaries |
 
@@ -230,6 +257,13 @@ it):
   },
   "watch": { "debounceMs": 120 },
   "noServers": false,
+  "ai": {
+    "endpoint": "http://127.0.0.1:8080/v1",
+    "model": "qwen3.8-27b-q4-k-m",
+    "maxTokens": 1200,
+    "timeoutMs": 120000,
+    "thinking": false
+  },
   "servers": {
     "typescript": {
       "command": "/opt/node/bin/typescript-language-server",
@@ -245,6 +279,61 @@ it):
 replace the defaults. `.git`, `node_modules`, virtualenvs, build outputs and
 similar noise directories are ignored by default.
 
+### Selection explanations
+
+`ai.endpoint` is any OpenAI-compatible base URL (llama.cpp, vLLM, LM Studio,
+or a hosted API). It defaults to `http://127.0.0.1:8080/v1` — llama.cpp's
+conventional address — so a local model works without config. When `model` is
+empty, VibeDE asks the endpoint for `/models` and uses the first id. The API key
+is optional and is only sent to that endpoint.
+
+Flags override the file; `VIBEDE_AI_ENDPOINT`, `VIBEDE_AI_MODEL` and
+`VIBEDE_AI_KEY` override the file too and are overridden by flags:
+
+```bash
+./bin/vibede --ai-url http://127.0.0.1:8080/v1 --ai-model qwen3.8-27b-q4-k-m
+./bin/vibede --no-ai
+```
+
+The request contains the selected snippet, the selection's file and up to four
+workspace files its imports resolve to (relative imports, package imports via
+`go.mod`, Python relative imports). Files outside the workspace are never read.
+Imports to the standard library or `node_modules` are skipped. `thinking: false`
+sets `chat_template_kwargs.enable_thinking = false` for reasoning models;
+enable it if you want the model to reason first.
+
+Each explanation is capped at **22,000 bytes of context** in total — selection
+plus file excerpts. That context is discarded as soon as the answer is written;
+only the question, answer, model name and the names of the files used are kept.
+
+The system prompt requires the answer to be a flat list of line-anchored notes:
+
+```
+- **Line 125**: what this line does
+- **Line 126-128**: what this range does together
+```
+
+The server parses those anchors (`internal/server/explain.go`) and stores them
+with the answer. Clicking an explanation card in Activity — or the “Show N line
+notes” button in the popover — renders each note as a comment-like block above
+its line. Notes occupy layout space but no line number, so the file's numbering
+does not shift; the `×` on a note removes it. Prose answers that do not follow
+the format still display in the popover and Activity, but place no inline notes.
+
+The full history lives in `.vibede.rab` in the workspace root:
+
+- a single gzip-compressed JSON document (version, update time, the newest 200
+  edit deltas and the newest 200 explanations with their parsed line notes), so
+  the archive is compressed “inside itself” and is self-contained;
+- written atomically (`.vibede.rab.tmp` then rename) at most once per second;
+- ignored by the watcher, the explorer and `git` (the repo's `.gitignore`
+  covers it), so it never shows up as an agent edit;
+- corrupt or missing archives are replaced on the next save.
+
+`GET /api/archive` returns the decoded history; the Activity panel merges it
+with the live edit stream and shows explanation cards above or below edits by
+timestamp.
+
 ## Architecture
 
 ```
@@ -259,8 +348,9 @@ internal/lsp          JSON-RPC/LSP client, server registry, diagnostics, nav
 internal/analyze      Go AST + generic lexers, complexity, Big-O, diagram builders
 internal/diagram      Graph model, deterministic layout, SVG/DOT/Mermaid renderers
 internal/highlight    Shared syntax tokenizer for the viewer
-internal/server       Read-only HTTP API, SSE broker, embedded assets
+internal/server       HTTP API (sources read-only) with .rab archive, SSE broker
 internal/config       `.vibede.json` loading and defaults
+internal/rab          gzip-compressed .rab history: deltas + explanations
 ```
 
 The interface logic is written in Go and compiled to WebAssembly.

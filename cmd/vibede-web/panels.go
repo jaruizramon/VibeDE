@@ -43,7 +43,7 @@ func (a *app) renderRightTabs() {
 		label string
 		count int
 	}{
-		{"activity", "Activity", len(a.changes)},
+		{"activity", "Activity", len(a.changes) + len(a.explanations)},
 		{"problems", "Problems", problems},
 		{"search", "Search", len(a.searchResults)},
 		{"diagrams", "Diagrams", 0},
@@ -89,58 +89,166 @@ func (a *app) renderRight() {
 func (a *app) renderActivityLocked() {
 	clear(a.els.rightBody)
 	panel := el("div", "panel")
-	if len(a.changes) == 0 {
+	if len(a.changes) == 0 && len(a.explanations) == 0 {
 		note := el("div", "panel-empty")
-		setText(note, "No edits observed yet. Agent writes to the workspace will appear here in real time with a line diff.")
+		setText(note, "No edits or explanations yet. Agent writes appear here in real time; selections you ask about are added with their answers.")
 		add(panel, note)
+		a.addArchiveNote(panel)
 		add(a.els.rightBody, panel)
 		return
 	}
+	type entry struct {
+		at time.Time
+		ch *Change
+		ex *ExplainRecord
+	}
+	items := make([]entry, 0, len(a.changes)+len(a.explanations))
+	for i := range a.changes {
+		items = append(items, entry{at: a.changes[i].At, ch: &a.changes[i]})
+	}
+	for i := range a.explanations {
+		items = append(items, entry{at: a.explanations[i].At, ex: &a.explanations[i]})
+	}
+	sort.SliceStable(items, func(i, j int) bool { return items[i].at.After(items[j].at) })
+	if len(items) > 300 {
+		items = items[:300]
+	}
 	list := el("div", "activity-list")
-	for _, ch := range a.changes {
-		item := el("div", "activity-item")
-		head := el("div", "activity-head")
-		kind := el("span", "activity-kind "+ch.Kind)
-		label := ch.Kind
-		if ch.IsDir {
-			label = "dir"
+	for _, it := range items {
+		if it.ex != nil {
+			add(list, a.explanationItem(*it.ex))
+			continue
 		}
-		setText(kind, label)
-		path := el("span", "activity-path")
-		setText(path, ch.Path)
-		when := el("span", "activity-time")
-		setText(when, changeTime(ch.At))
-		add(head, kind, path, when)
-		add(item, head)
-		if ch.Binary {
-			note := el("div", "activity-stats")
-			setText(note, "binary file changed")
-			add(item, note)
-		} else if ch.Stats.Added+ch.Stats.Removed > 0 || ch.HunksOmitted {
-			stats := el("div", "activity-stats")
-			addEl := el("span", "stat-add")
-			setText(addEl, "+"+strconv.Itoa(ch.Stats.Added))
-			del := el("span", "stat-del")
-			setText(del, "−"+strconv.Itoa(ch.Stats.Removed))
-			add(stats, addEl, del)
-			if ch.HunksOmitted {
-				om := el("span", "")
-				setText(om, "diff truncated")
-				add(stats, om)
-			}
-			add(item, stats)
-			if len(ch.Hunks) > 0 {
-				add(item, renderDiff(ch.Hunks, 14))
-			}
-		}
-		c := ch
-		on(item, "click", func(js.Value) {
-			go a.openChange(c)
-		})
-		add(list, item)
+		add(list, a.changeItem(*it.ch))
 	}
 	add(panel, list)
+	a.addArchiveNote(panel)
 	add(a.els.rightBody, panel)
+}
+
+func (a *app) changeItem(ch Change) js.Value {
+	item := el("div", "activity-item")
+	head := el("div", "activity-head")
+	kind := el("span", "activity-kind "+ch.Kind)
+	label := ch.Kind
+	if ch.IsDir {
+		label = "dir"
+	}
+	setText(kind, label)
+	path := el("span", "activity-path")
+	setText(path, ch.Path)
+	when := el("span", "activity-time")
+	setText(when, changeTime(ch.At))
+	add(head, kind, path, when)
+	add(item, head)
+	if ch.Binary {
+		note := el("div", "activity-stats")
+		setText(note, "binary file changed")
+		add(item, note)
+	} else if ch.Stats.Added+ch.Stats.Removed > 0 || ch.HunksOmitted {
+		stats := el("div", "activity-stats")
+		addEl := el("span", "stat-add")
+		setText(addEl, "+"+strconv.Itoa(ch.Stats.Added))
+		del := el("span", "stat-del")
+		setText(del, "−"+strconv.Itoa(ch.Stats.Removed))
+		add(stats, addEl, del)
+		if ch.HunksOmitted {
+			om := el("span", "")
+			setText(om, "diff truncated")
+			add(stats, om)
+		}
+		add(item, stats)
+		if len(ch.Hunks) > 0 {
+			add(item, renderDiff(ch.Hunks, 14))
+		}
+	}
+	c := ch
+	on(item, "click", func(js.Value) {
+		go a.openChange(c)
+	})
+	return item
+}
+
+func (a *app) explanationItem(ex ExplainRecord) js.Value {
+	item := el("div", "activity-item explain-item")
+	head := el("div", "activity-head")
+	kind := el("span", "activity-kind explain")
+	setText(kind, "explain")
+	label := ex.Path
+	if label == "" {
+		label = "selection"
+	}
+	if ex.StartLine > 0 {
+		if ex.StartLine == ex.EndLine {
+			label = fmt.Sprintf("%s:%d", label, ex.StartLine)
+		} else {
+			label = fmt.Sprintf("%s:%d-%d", label, ex.StartLine, ex.EndLine)
+		}
+	}
+	path := el("span", "activity-path")
+	setText(path, label)
+	path.Set("title", label)
+	when := el("span", "activity-time")
+	setText(when, changeTime(ex.At))
+	add(head, kind, path, when)
+	add(item, head)
+
+	q := el("div", "explain-q")
+	setText(q, "Q: "+ex.Question)
+	add(item, q)
+	answer := el("pre", "activity-answer")
+	setText(answer, ex.Answer)
+	add(item, answer)
+
+	meta := el("div", "activity-meta")
+	parts := []string{ex.Model}
+	if len(ex.Context) > 0 {
+		noun := "files"
+		if len(ex.Context) == 1 {
+			noun = "file"
+		}
+		parts = append(parts, fmt.Sprintf("%d %s: %s", len(ex.Context), noun, strings.Join(ex.Context, ", ")))
+	}
+	if len(ex.Annotations) > 0 {
+		noun := "line notes"
+		if len(ex.Annotations) == 1 {
+			noun = "line note"
+		}
+		parts = append(parts, fmt.Sprintf("%d %s · click to show", len(ex.Annotations), noun))
+	}
+	setText(meta, strings.Join(parts, " · "))
+	add(item, meta)
+
+	if ex.Path != "" {
+		e := ex
+		on(item, "click", func(js.Value) {
+			go a.applyAnnotations(e)
+		})
+	}
+	return item
+}
+
+// addArchiveNote shows where the history lives and how much it holds.
+func (a *app) addArchiveNote(panel js.Value) {
+	path := a.archive.Path
+	if path == "" {
+		path = ".vibede.rab"
+	}
+	note := el("div", "archive-note")
+	exNoun, edNoun := "explanations", "edits"
+	if len(a.explanations) == 1 {
+		exNoun = "explanation"
+	}
+	if len(a.changes) == 1 {
+		edNoun = "edit"
+	}
+	text := fmt.Sprintf("%s · %d %s · %d %s", path, len(a.explanations), exNoun, len(a.changes), edNoun)
+	if a.archive.Bytes > 0 {
+		text += " · " + compactNum(a.archive.Bytes)
+	}
+	setText(note, text)
+	note.Set("title", "History is stored gzip-compressed in the workspace root. Explanation contexts are not stored, only file names.")
+	add(panel, note)
 }
 
 func changeTime(t time.Time) string {

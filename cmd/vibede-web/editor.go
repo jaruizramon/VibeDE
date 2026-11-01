@@ -640,6 +640,41 @@ func dirName(p string) string {
 	return ""
 }
 
+// closeActiveTab closes the focused pane's active tab, if any.
+func (a *app) closeActiveTab() {
+	a.mu.Lock()
+	pane := a.focusedPane()
+	if pane == nil || pane.active == "" {
+		a.mu.Unlock()
+		return
+	}
+	idx, path := pane.idx, pane.active
+	a.mu.Unlock()
+	a.closeTab(idx, path)
+}
+
+// cycleTab activates the next (delta 1) or previous (delta -1) tab in the
+// focused pane, wrapping at the ends.
+func (a *app) cycleTab(delta int) {
+	a.mu.Lock()
+	pane := a.focusedPane()
+	if pane == nil || len(pane.order) < 2 {
+		a.mu.Unlock()
+		return
+	}
+	idx := 0
+	for i, p := range pane.order {
+		if p == pane.active {
+			idx = i
+			break
+		}
+	}
+	n := len(pane.order)
+	next := pane.order[(idx+delta+n)%n]
+	a.mu.Unlock()
+	a.activateTab(pane.idx, next)
+}
+
 func (a *app) closeTab(paneIdx int, p string) {
 	a.mu.Lock()
 	pane := a.paneAt(paneIdx)
@@ -972,6 +1007,11 @@ func (a *app) renderEditorLocked(paneIdx int) {
 	}
 	for i := 0; i < limit; i++ {
 		line := lines[i]
+		for idx, note := range a.notes[t.Path] {
+			if note.StartLine-1 == i {
+				add(pane.code, a.codeNoteElement(paneIdx, t.Path, idx, note))
+			}
+		}
 		row := el("div", "code-line")
 		setData(row, "line", strconv.Itoa(i))
 		classes := "code-line"

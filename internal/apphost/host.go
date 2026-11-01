@@ -23,6 +23,7 @@ type Options struct {
 	URLHost      string // host shown in URLs; defaults to ListenHost or loopback
 	Port         int    // 0 lets the kernel choose
 	NoServers    bool
+	AI           *config.AIConfig // non-nil fields override .vibede.json
 	WindowOpener func(url, title string) error
 }
 
@@ -109,6 +110,7 @@ func (m *Manager) start(root string) (*instance, error) {
 		return nil, err
 	}
 	cfg.NoServers = cfg.NoServers || m.opts.NoServers
+	config.ApplyAIOverrides(&cfg, m.opts.AI)
 	addr := net.JoinHostPort(m.opts.ListenHost, strconv.Itoa(m.opts.Port))
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {

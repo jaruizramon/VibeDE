@@ -107,6 +107,12 @@ type app struct {
 	limit     int
 	charW     float64
 
+	explain      explainState
+	explainPop   js.Value
+	explanations []ExplainRecord
+	archive      ArchiveInfo
+	notes        map[string][]Annotation
+
 	els elements
 	es  js.Value
 }
@@ -150,6 +156,7 @@ func main() {
 		servers:     nil,
 		diags:       make(map[string]FileDiagnostics),
 		seen:        make(map[string]bool),
+		notes:       make(map[string][]Annotation),
 		rightTab:    "activity",
 		diagKind:    "flowchart",
 		diagMode:    "svg",
@@ -171,6 +178,7 @@ func main() {
 	a.buildShell(js.Value{})
 	a.measureChar()
 	a.bindGlobalKeys()
+	a.bindExplain()
 	go a.boot()
 	select {}
 }
@@ -219,7 +227,7 @@ func (a *app) buildShell(_ js.Value) {
 
 	find := el("button", "icon-btn")
 	setText(find, "⌕")
-	find.Set("title", "Search code (Ctrl+Shift+F)")
+	find.Set("title", "Search code (Ctrl/⌘+F)")
 	on(find, "click", func(js.Value) { a.setRightTab("search") })
 
 	help := el("button", "icon-btn")
@@ -315,7 +323,7 @@ func (a *app) buildShell(_ js.Value) {
 		}
 		on(paneEl, "pointerdown", func(js.Value) { a.focusPane(idx) })
 		on(code, "click", func(ev js.Value) { a.onCodeClick(idx, ev) })
-		on(scroll, "scroll", func(js.Value) { a.saveScroll(idx) })
+		on(scroll, "scroll", func(js.Value) { a.saveScroll(idx); a.hideExplain() })
 	}
 	status := el("div", "statusbar")
 	a.els.status = status
@@ -373,6 +381,7 @@ func (a *app) boot() {
 	if err != nil {
 		a.toast("Cannot read workspace tree: "+err.Error(), "err")
 	}
+	arch, archErr := fetchArchive()
 	servers := info.Servers
 	a.mu.Lock()
 	a.info = info
@@ -382,6 +391,21 @@ func (a *app) boot() {
 	a.limit = info.Limits.MaxRenderedLines
 	if a.limit <= 0 {
 		a.limit = 12000
+	}
+	a.archive = info.Archive
+	if archErr == nil {
+		a.archive = ArchiveInfo{
+			Path:         arch.Path,
+			Bytes:        arch.Bytes,
+			Changes:      len(arch.Changes),
+			Explanations: len(arch.Explanations),
+		}
+		changes := arch.Changes
+		if len(changes) > 200 {
+			changes = changes[:200]
+		}
+		a.changes = changes
+		a.explanations = arch.Explanations
 	}
 	a.tree[""] = entries
 	a.mu.Unlock()
@@ -482,25 +506,97 @@ func (a *app) toast(msg, kind string) {
 func (a *app) bindGlobalKeys() {
 	on(doc(), "keydown", func(ev js.Value) {
 		key := ev.Get("key").String()
+		code := ev.Get("code").String()
 		ctrl := ev.Get("ctrlKey").Bool() || ev.Get("metaKey").Bool()
+		alt := ev.Get("altKey").Bool()
 		shift := ev.Get("shiftKey").Bool()
-		if ctrl && shift && strings.EqualFold(key, "f") {
+		stop := func() {
 			ev.Call("preventDefault")
-			a.setRightTab("search")
-			return
+			ev.Call("stopPropagation")
 		}
-		if ctrl && strings.EqualFold(key, "k") {
-			ev.Call("preventDefault")
-			a.els.search.Call("focus")
-			a.els.search.Call("select")
-			return
-		}
-		if key == "Escape" {
-			if a.els.helpModal.Truthy() {
+
+		if a.els.helpModal.Truthy() {
+			if key == "Escape" || key == "F1" {
+				stop()
 				a.toggleHelp(false)
+			}
+			return
+		}
+		if key == "F1" {
+			stop()
+			a.toggleHelp(true)
+			return
+		}
+		if key == "Escape" && a.explainPop.Truthy() {
+			stop()
+			a.hideExplain()
+			return
+		}
+		if ctrl && strings.EqualFold(key, "f") {
+			stop()
+			if !a.detached {
+				a.setRightTab("search")
+			}
+			return
+		}
+		if ctrl && strings.EqualFold(key, "e") {
+			stop()
+			a.ctrlExplain()
+			return
+		}
+		if ctrl && (strings.EqualFold(key, "k") || strings.EqualFold(key, "p")) {
+			stop()
+			if !a.detached {
+				a.els.search.Call("focus")
+				a.els.search.Call("select")
+			}
+			return
+		}
+		if ctrl && strings.EqualFold(key, "w") {
+			stop()
+			a.closeActiveTab()
+			return
+		}
+		if ctrl && (code == "Backslash" || key == "\\") {
+			stop()
+			a.toggleSplit()
+			return
+		}
+		if ctrl && key == "PageDown" {
+			stop()
+			a.cycleTab(1)
+			return
+		}
+		if ctrl && key == "PageUp" {
+			stop()
+			a.cycleTab(-1)
+			return
+		}
+		if alt && !ctrl && !shift && !a.detached {
+			if tab, ok := rightTabForKey(code, key); ok {
+				stop()
+				a.setRightTab(tab)
 			}
 		}
 	})
+}
+
+// rightTabForKey maps Alt+1…5 to the right-hand panels in display order.
+func rightTabForKey(code, key string) (string, bool) {
+	tabs := []string{"activity", "problems", "search", "diagrams", "inspector"}
+	n := 0
+	switch {
+	case strings.HasPrefix(code, "Digit"):
+		n, _ = strconv.Atoi(strings.TrimPrefix(code, "Digit"))
+	case strings.HasPrefix(code, "Numpad"):
+		n, _ = strconv.Atoi(strings.TrimPrefix(code, "Numpad"))
+	case len(key) == 1 && key[0] >= '1' && key[0] <= '5':
+		n = int(key[0] - '0')
+	}
+	if n < 1 || n > len(tabs) {
+		return "", false
+	}
+	return tabs[n-1], true
 }
 
 func (a *app) toggleHelp(show bool) {
@@ -528,10 +624,19 @@ func (a *app) toggleHelp(show bool) {
 		cards := [][2]string{
 			{"Ctrl / ⌘ + click", "Go to definition (language server)."},
 			{"Alt + click", "Find references; results open in Inspector."},
-			{"Ctrl / ⌘ + K", "Focus the file filter."},
+			{"Ctrl / ⌘ + F", "Find across the workspace (also Ctrl/⌘ + Shift + F)."},
+			{"Ctrl / ⌘ + E", "Ask the small model about the selected code (opens a selection popover)."},
+			{"Select code", "A popover appears; ask what it does. The model sees this file and its imports."},
+			{"Ctrl / ⌘ + K or P", "Focus the file filter."},
+			{"Ctrl / ⌘ + W", "Close the active tab."},
+			{"Ctrl / ⌘ + \\", "Toggle the split editor."},
+			{"Ctrl / ⌘ + PgDn / PgUp", "Next / previous tab."},
+			{"Alt + 1…5", "Activity, Problems, Search, Diagrams, Inspector."},
+			{"F1", "Open this help; Esc closes it."},
 			{"Big-O badges", "Click a badge or an outline row for evidence."},
 			{"Diagrams", "Deterministic flowchart, UML, use-case, sequence and import views."},
 			{"Live edits", "Agent writes stream into Activity with a line diff."},
+			{"History", "Edits and explanations persist in .vibede.rab, gzip-compressed in the workspace root."},
 		}
 		for _, c := range cards {
 			card := el("div", "welcome-card")

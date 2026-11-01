@@ -25,6 +25,10 @@ func (e *httpError) Error() string {
 }
 
 func request(method, path string, payload any) ([]byte, int, error) {
+	return requestWithTimeout(method, path, payload, 90*time.Second)
+}
+
+func requestWithTimeout(method, path string, payload any, timeout time.Duration) ([]byte, int, error) {
 	opts := js.Global().Get("Object").New()
 	opts.Set("method", method)
 	if payload != nil {
@@ -85,7 +89,7 @@ func request(method, path string, payload any) ([]byte, int, error) {
 			return r.data, r.status, &httpError{Status: r.status, API: api}
 		}
 		return r.data, r.status, nil
-	case <-time.After(90 * time.Second):
+	case <-time.After(timeout):
 		return nil, 0, errors.New("request timed out")
 	}
 }
@@ -159,6 +163,12 @@ func fetchAllDiagnostics() ([]FileDiagnostics, error) {
 	}
 	err := apiGet("/api/diagnostics", &resp)
 	return resp.Files, err
+}
+
+func fetchArchive() (ArchiveResponse, error) {
+	var resp ArchiveResponse
+	err := apiGet("/api/archive", &resp)
+	return resp, err
 }
 
 func fetchServers() ([]Server, error) {

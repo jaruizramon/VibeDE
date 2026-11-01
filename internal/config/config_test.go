@@ -55,6 +55,46 @@ func TestLoadDefaultsAndOverrides(t *testing.T) {
 	}
 }
 
+func TestLoadAIConfig(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("VIBEDE_AI_ENDPOINT", "")
+	t.Setenv("VIBEDE_AI_MODEL", "")
+	t.Setenv("VIBEDE_AI_KEY", "")
+	cfg, err := Load(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.AI.Enabled || cfg.AI.Endpoint != defaultAIEndpoint || cfg.AI.MaxTokens != 1200 {
+		t.Fatalf("defaults = %+v", cfg.AI)
+	}
+	body := `{"ai": {"endpoint": "http://127.0.0.1:9000/v1", "model": "tiny", "apiKey": "k", "maxTokens": 300, "timeoutMs": 5000, "thinking": true}}`
+	if err := os.WriteFile(filepath.Join(root, ".vibede.json"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AI.Endpoint != "http://127.0.0.1:9000/v1" || cfg.AI.Model != "tiny" ||
+		cfg.AI.APIKey != "k" || cfg.AI.MaxTokens != 300 || cfg.AI.TimeoutMS != 5000 || !cfg.AI.Thinking {
+		t.Fatalf("file config = %+v", cfg.AI)
+	}
+
+	// Environment beats the file; flags beat both.
+	t.Setenv("VIBEDE_AI_MODEL", "from-env")
+	cfg, err = Load(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AI.Model != "from-env" {
+		t.Fatalf("env model = %q", cfg.AI.Model)
+	}
+	ApplyAIOverrides(&cfg, &AIConfig{Model: "from-flag", Disabled: true})
+	if cfg.AI.Model != "from-flag" || cfg.AI.Enabled {
+		t.Fatalf("flag override = %+v", cfg.AI)
+	}
+}
+
 func TestLoadInvalidConfig(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, ".vibede.json"), []byte("{"), 0o644); err != nil {

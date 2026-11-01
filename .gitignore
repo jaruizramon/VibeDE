@@ -2,3 +2,7 @@
 /internal/server/web/app.wasm
 /internal/server/web/wasm_exec.js
 /vibede
+
+# VibeDE history archive
+.vibede.rab
+.vibede.rab.tmp
